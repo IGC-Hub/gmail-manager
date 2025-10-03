@@ -1,0 +1,603 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gestionnaire Gmail Professionnel</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-50">
+    <div id="app">
+        <div class="min-h-screen flex items-center justify-center">
+            <div class="text-center">
+                <div class="inline-block animate-spin rounded-full h-16 w-16 border-t-2 border-b-2 border-blue-500 mb-4"></div>
+                <p class="text-xl font-semibold text-gray-700">Initialisation...</p>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const CLAUDE_API_KEY = window.ENV_ANTHROPIC_API_KEY || 'YOUR_ANTHROPIC_API_KEY_HERE'; 
+        const CLIENT_ID = '465690035223-inb9ab53rpfppa8h5nogs3bbhebp4593.apps.googleusercontent.com';
+        const SCOPES = 'https://www.googleapis.com/auth/gmail.readonly';
+
+        let emails = [];
+        let activeTab = 'dashboard';
+        let gapiInited = false;
+        let gisInited = false;
+        let tokenClient;
+
+        // Charger le script Google API
+        function loadGoogleAPI() {
+            const script = document.createElement('script');
+            script.src = 'https://apis.google.com/js/api.js';
+            script.onload = gapiLoaded;
+            document.body.appendChild(script);
+
+            const script2 = document.createElement('script');
+            script2.src = 'https://accounts.google.com/gsi/client';
+            script2.onload = gisLoaded;
+            document.body.appendChild(script2);
+        }
+
+        function gapiLoaded() {
+            gapi.load('client', initializeGapiClient);
+        }
+
+        async function initializeGapiClient() {
+            await gapi.client.init({
+                discoveryDocs: ['https://www.googleapis.com/discovery/v1/apis/gmail/v1/rest'],
+            });
+            gapiInited = true;
+            maybeEnableButtons();
+        }
+
+        function gisLoaded() {
+            tokenClient = google.accounts.oauth2.initTokenClient({
+                client_id: CLIENT_ID,
+                scope: SCOPES,
+                callback: '', // défini plus tard
+            });
+            gisInited = true;
+            maybeEnableButtons();
+        }
+
+        function maybeEnableButtons() {
+            if (gapiInited && gisInited) {
+                renderLoginScreen();
+            }
+        }
+
+        function renderLoginScreen() {
+            document.getElementById('app').innerHTML = `
+                <div class="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 flex items-center justify-center p-6">
+                    <div class="bg-white rounded-2xl shadow-xl p-12 max-w-md text-center">
+                        <div class="mb-6">
+                            <div class="text-6xl mb-4">📧</div>
+                            <h1 class="text-3xl font-bold text-gray-800 mb-2">Gestionnaire Gmail</h1>
+                            <p class="text-gray-600">Connectez-vous à Gmail pour analyser vos courriels et extraire automatiquement les actions à faire</p>
+                        </div>
+                        
+                        <button onclick="handleAuthClick()" class="bg-blue-500 hover:bg-blue-600 text-white font-semibold px-8 py-3 rounded-lg transition flex items-center gap-2 mx-auto">
+                            <span>📧</span>
+                            Connecter Gmail
+                        </button>
+                        
+                        <div class="mt-6 text-sm text-gray-500">
+                            <p>✓ Analyse intelligente par IA</p>
+                            <p>✓ Extraction automatique d'actions</p>
+                            <p>✓ Classification des pièces jointes</p>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        function handleAuthClick() {
+            tokenClient.callback = async (resp) => {
+                if (resp.error !== undefined) {
+                    throw (resp);
+                }
+                await loadGmailMessages();
+            };
+
+            if (gapi.client.getToken() === null) {
+                tokenClient.requestAccessToken({prompt: 'consent'});
+            } else {
+                tokenClient.requestAccessToken({prompt: ''});
+            }
+        }
+
+        function handleSignoutClick() {
+            const token = gapi.client.getToken();
+            if (token !== null) {
+                google.accounts.oauth2.revoke(token.access_token);
+                gapi.client.setToken('');
+                emails = [];
+                renderLoginScreen();
+            }
+        }
+
+        async function analyzeEmailWithClaude(emailContent) {
+            try {
+                const response = await fetch("https://api.anthropic.com/v1/messages", {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                        "x-api-key": CLAUDE_API_KEY,
+                        "anthropic-version": "2023-06-01"
+                    },
+                    body: JSON.stringify({
+                        model: "claude-sonnet-4-20250514",
+                        max_tokens: 1000,
+                        messages: [
+                            { 
+                                role: "user", 
+                                content: `Analyse ce courriel et identifie toutes les actions à faire. Réponds UNIQUEMENT avec un objet JSON valide, sans texte avant ou après, sans balises markdown.
+
+Format attendu:
+{
+  "actions": [
+    {"type": "meeting", "text": "description", "priority": "high|medium|low"},
+    {"type": "call", "text": "description", "priority": "high|medium|low"},
+    {"type": "task", "text": "description", "priority": "high|medium|low"}
+  ]
+}
+
+Courriel à analyser:
+${emailContent}
+
+IMPORTANT: Réponds UNIQUEMENT avec le JSON, rien d'autre.`
+                            }
+                        ]
+                    })
+                });
+
+                const data = await response.json();
+                let responseText = data.content[0].text;
+                responseText = responseText.replace(/\`\`\`json\n?/g, "").replace(/\`\`\`\n?/g, "").trim();
+                const analysis = JSON.parse(responseText);
+                return analysis.actions || [];
+            } catch (err) {
+                console.error("Erreur analyse Claude:", err);
+                return [];
+            }
+        }
+
+        async function loadGmailMessages() {
+            showLoading(true);
+            
+            try {
+                const response = await gapi.client.gmail.users.messages.list({
+                    userId: 'me',
+                    maxResults: 10,
+                    q: 'is:unread OR newer_than:1d'
+                });
+
+                const messages = response.result.messages || [];
+                
+                if (messages.length === 0) {
+                    emails = [];
+                    render();
+                    return;
+                }
+
+                showAnalyzing(true);
+                const emailPromises = messages.map(async (msg) => {
+                    const msgData = await gapi.client.gmail.users.messages.get({
+                        userId: 'me',
+                        id: msg.id
+                    });
+
+                    const message = msgData.result;
+                    const headers = message.payload.headers;
+                    const from = headers.find(h => h.name === 'From')?.value || 'Inconnu';
+                    const subject = headers.find(h => h.name === 'Subject')?.value || 'Sans objet';
+                    const date = headers.find(h => h.name === 'Date')?.value || '';
+
+                    let body = '';
+                    if (message.payload.body.data) {
+                        body = atob(message.payload.body.data.replace(/-/g, '+').replace(/_/g, '/'));
+                    } else if (message.payload.parts) {
+                        const textPart = message.payload.parts.find(p => p.mimeType === 'text/plain');
+                        if (textPart && textPart.body.data) {
+                            body = atob(textPart.body.data.replace(/-/g, '+').replace(/_/g, '/'));
+                        }
+                    }
+
+                    const attachments = [];
+                    if (message.payload.parts) {
+                        message.payload.parts.forEach(part => {
+                            if (part.filename && part.filename.length > 0) {
+                                let category = 'Autres';
+                                let type = 'file';
+
+                                if (part.mimeType.includes('pdf')) {
+                                    category = 'Documents PDF';
+                                    type = 'pdf';
+                                } else if (part.mimeType.includes('image')) {
+                                    category = 'Images';
+                                    type = 'image';
+                                } else if (part.mimeType.includes('word') || part.mimeType.includes('document')) {
+                                    category = 'Documents Word';
+                                    type = 'document';
+                                } else if (part.mimeType.includes('excel') || part.mimeType.includes('spreadsheet')) {
+                                    category = 'Tableurs';
+                                    type = 'document';
+                                }
+
+                                attachments.push({
+                                    name: part.filename,
+                                    type: type,
+                                    category: category,
+                                    mimeType: part.mimeType
+                                });
+                            }
+                        });
+                    }
+
+                    const actions = await analyzeEmailWithClaude(`De: ${from}\nSujet: ${subject}\n\n${body.substring(0, 1000)}`);
+
+                    const timeMatch = date.match(/\d{1,2}:\d{2}/);
+                    const time = timeMatch ? timeMatch[0] : 'N/A';
+
+                    return {
+                        id: msg.id,
+                        from,
+                        subject,
+                        time,
+                        content: body.substring(0, 500) + (body.length > 500 ? '...' : ''),
+                        actions,
+                        attachments
+                    };
+                });
+
+                emails = await Promise.all(emailPromises);
+                render();
+            } catch (err) {
+                console.error('Erreur:', err);
+                showError('Erreur lors du chargement des courriels: ' + err.message);
+            } finally {
+                showLoading(false);
+                showAnalyzing(false);
+            }
+        }
+
+        function showLoading(show) {
+            if (show) {
+                document.getElementById('app').innerHTML = `
+                    <div class="min-h-screen flex items-center justify-center">
+                        <div class="text-center">
+                            <div class="inline-block animate-spin rounded-full h-16 w-16 border-t-2 border-b-2 border-blue-500 mb-4"></div>
+                            <p class="text-xl font-semibold text-gray-700">Chargement de vos courriels...</p>
+                        </div>
+                    </div>
+                `;
+            }
+        }
+
+        function showAnalyzing(show) {
+            if (show) {
+                document.getElementById('app').innerHTML = `
+                    <div class="min-h-screen flex items-center justify-center">
+                        <div class="text-center">
+                            <div class="inline-block animate-spin rounded-full h-16 w-16 border-t-2 border-b-2 border-blue-500 mb-4"></div>
+                            <p class="text-xl font-semibold text-gray-700">Analyse intelligente en cours...</p>
+                            <p class="text-gray-500 mt-2">L'IA analyse vos courriels pour extraire les actions</p>
+                        </div>
+                    </div>
+                `;
+            }
+        }
+
+        function showError(message) {
+            document.getElementById('app').innerHTML = `
+                <div class="min-h-screen flex items-center justify-center p-6">
+                    <div class="bg-white rounded-lg shadow-lg p-8 max-w-md text-center">
+                        <div class="text-red-500 text-6xl mb-4">⚠️</div>
+                        <h2 class="text-2xl font-bold text-gray-800 mb-2">Erreur</h2>
+                        <p class="text-gray-600 mb-6">${message}</p>
+                        <button onclick="location.reload()" class="bg-blue-500 hover:bg-blue-600 text-white font-semibold px-6 py-2 rounded-lg">
+                            Réessayer
+                        </button>
+                    </div>
+                </div>
+            `;
+        }
+
+        function render() {
+            const allActions = emails.flatMap(email => 
+                email.actions.map(action => ({ ...action, emailFrom: email.from, emailSubject: email.subject }))
+            );
+
+            const meetings = allActions.filter(a => a.type === 'meeting');
+            const calls = allActions.filter(a => a.type === 'call');
+            const tasks = allActions.filter(a => a.type === 'task');
+
+            const allAttachments = emails.flatMap(email => email.attachments);
+            const attachmentsByCategory = {};
+            allAttachments.forEach(att => {
+                if (!attachmentsByCategory[att.category]) {
+                    attachmentsByCategory[att.category] = [];
+                }
+                attachmentsByCategory[att.category].push(att);
+            });
+
+            let content = '';
+
+            if (activeTab === 'dashboard') {
+                const highPriorityActions = allActions.filter(a => a.priority === 'high');
+                
+                content = `
+                    <div class="space-y-6">
+                        <div class="bg-gradient-to-r from-blue-500 to-blue-600 rounded-lg shadow-lg p-6 text-white">
+                            <h2 class="text-2xl font-bold mb-4">📊 Résumé</h2>
+                            <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+                                <div class="bg-white bg-opacity-20 rounded-lg p-4">
+                                    <div class="text-3xl font-bold">${emails.length}</div>
+                                    <div class="text-sm">Courriels</div>
+                                </div>
+                                <div class="bg-white bg-opacity-20 rounded-lg p-4">
+                                    <div class="text-3xl font-bold">${meetings.length}</div>
+                                    <div class="text-sm">Rendez-vous</div>
+                                </div>
+                                <div class="bg-white bg-opacity-20 rounded-lg p-4">
+                                    <div class="text-3xl font-bold">${calls.length}</div>
+                                    <div class="text-sm">Appels</div>
+                                </div>
+                                <div class="bg-white bg-opacity-20 rounded-lg p-4">
+                                    <div class="text-3xl font-bold">${tasks.length}</div>
+                                    <div class="text-sm">Tâches</div>
+                                </div>
+                            </div>
+                        </div>
+
+                        ${highPriorityActions.length > 0 ? `
+                            <div class="bg-white rounded-lg shadow-sm p-6">
+                                <h3 class="text-xl font-bold text-gray-800 mb-4 flex items-center gap-2">
+                                    <span>⚠️</span>
+                                    Actions prioritaires
+                                </h3>
+                                <div class="space-y-3">
+                                    ${highPriorityActions.map(action => `
+                                        <div class="flex items-start gap-3 p-3 bg-red-50 rounded-lg border border-red-200">
+                                            <div class="mt-1">${getActionIcon(action.type)}</div>
+                                            <div class="flex-1">
+                                                <div class="font-medium text-gray-800">${action.text}</div>
+                                                <div class="text-sm text-gray-600 mt-1">Sujet: ${action.emailSubject}</div>
+                                            </div>
+                                        </div>
+                                    `).join('')}
+                                </div>
+                            </div>
+                        ` : ''}
+
+                        ${allAttachments.length > 0 ? `
+                            <div class="bg-white rounded-lg shadow-sm p-6">
+                                <h3 class="text-xl font-bold text-gray-800 mb-4">📎 Pièces jointes récentes</h3>
+                                <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                    ${allAttachments.slice(0, 6).map(att => `
+                                        <div class="flex items-center gap-3 p-3 bg-gray-50 rounded-lg">
+                                            ${getFileIcon(att.type)}
+                                            <div class="flex-1 min-w-0">
+                                                <div class="font-medium text-gray-800 text-sm truncate">${att.name}</div>
+                                                <div class="text-xs text-gray-500">${att.category}</div>
+                                            </div>
+                                        </div>
+                                    `).join('')}
+                                </div>
+                            </div>
+                        ` : ''}
+                    </div>
+                `;
+            } else if (activeTab === 'actions') {
+                content = `
+                    <div class="space-y-6">
+                        ${meetings.length > 0 ? `
+                            <div class="bg-white rounded-lg shadow-sm p-6">
+                                <h3 class="text-xl font-bold text-gray-800 mb-4">📅 Rendez-vous et réunions (${meetings.length})</h3>
+                                <div class="space-y-3">
+                                    ${meetings.map(meeting => `
+                                        <div class="p-4 rounded-lg border ${getPriorityClass(meeting.priority)}">
+                                            <div class="font-medium">${meeting.text}</div>
+                                            <div class="text-sm mt-1">Sujet: ${meeting.emailSubject}</div>
+                                        </div>
+                                    `).join('')}
+                                </div>
+                            </div>
+                        ` : ''}
+
+                        ${calls.length > 0 ? `
+                            <div class="bg-white rounded-lg shadow-sm p-6">
+                                <h3 class="text-xl font-bold text-gray-800 mb-4">📞 Appels à faire (${calls.length})</h3>
+                                <div class="space-y-3">
+                                    ${calls.map(call => `
+                                        <div class="p-4 rounded-lg border ${getPriorityClass(call.priority)}">
+                                            <div class="font-medium">${call.text}</div>
+                                            <div class="text-sm mt-1">Sujet: ${call.emailSubject}</div>
+                                        </div>
+                                    `).join('')}
+                                </div>
+                            </div>
+                        ` : ''}
+
+                        ${tasks.length > 0 ? `
+                            <div class="bg-white rounded-lg shadow-sm p-6">
+                                <h3 class="text-xl font-bold text-gray-800 mb-4">✅ Tâches à accomplir (${tasks.length})</h3>
+                                <div class="space-y-3">
+                                    ${tasks.map(task => `
+                                        <div class="p-4 rounded-lg border ${getPriorityClass(task.priority)}">
+                                            <div class="font-medium">${task.text}</div>
+                                            <div class="text-sm mt-1">Sujet: ${task.emailSubject}</div>
+                                        </div>
+                                    `).join('')}
+                                </div>
+                            </div>
+                        ` : ''}
+
+                        ${allActions.length === 0 ? `
+                            <div class="bg-white rounded-lg shadow-sm p-12 text-center">
+                                <div class="text-gray-300 text-6xl mb-4">✅</div>
+                                <p class="text-gray-500">Aucune action détectée dans vos courriels</p>
+                            </div>
+                        ` : ''}
+                    </div>
+                `;
+            } else if (activeTab === 'attachments') {
+                content = `
+                    <div class="bg-white rounded-lg shadow-sm p-6">
+                        <h3 class="text-xl font-bold text-gray-800 mb-4">📁 Pièces jointes classées</h3>
+                        ${Object.keys(attachmentsByCategory).length > 0 ? 
+                            Object.entries(attachmentsByCategory).map(([category, files]) => `
+                                <div class="mb-6">
+                                    <h4 class="font-bold text-gray-700 mb-3 text-lg">${category} (${files.length})</h4>
+                                    <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                        ${files.map(file => `
+                                            <div class="flex items-center gap-3 p-4 bg-gray-50 rounded-lg border border-gray-200 hover:bg-gray-100 transition">
+                                                ${getFileIcon(file.type)}
+                                                <div class="flex-1 min-w-0">
+                                                    <div class="font-medium text-gray-800 truncate">${file.name}</div>
+                                                    <div class="text-xs text-gray-500 uppercase">${file.type}</div>
+                                                </div>
+                                            </div>
+                                        `).join('')}
+                                    </div>
+                                </div>
+                            `).join('')
+                            : `
+                            <div class="text-center py-12">
+                                <div class="text-gray-300 text-6xl mb-4">📎</div>
+                                <p class="text-gray-500">Aucune pièce jointe trouvée</p>
+                            </div>
+                        `}
+                    </div>
+                `;
+            } else {
+                content = `
+                    <div class="space-y-4">
+                        ${emails.map(email => `
+                            <div class="bg-white rounded-lg shadow-sm p-6 hover:shadow-md transition">
+                                <div class="flex justify-between items-start mb-3">
+                                    <div class="flex-1 min-w-0">
+                                        <div class="font-bold text-gray-800 mb-1 truncate">${email.subject}</div>
+                                        <div class="text-sm text-gray-600 truncate">De: ${email.from}</div>
+                                    </div>
+                                    <div class="text-sm text-gray-500 ml-4">🕐 ${email.time}</div>
+                                </div>
+                                <p class="text-gray-700 mb-4 whitespace-pre-wrap">${email.content}</p>
+                                
+                                ${email.actions.length > 0 ? `
+                                    <div class="mb-3">
+                                        <div class="text-sm font-medium text-gray-700 mb-2">Actions détectées:</div>
+                                        <div class="space-y-2">
+                                            ${email.actions.map(action => `
+                                                <div class="flex items-center gap-2 p-2 rounded text-sm border ${getPriorityClass(action.priority)}">
+                                                    ${getActionIcon(action.type)}
+                                                    <span>${action.text}</span>
+                                                </div>
+                                            `).join('')}
+                                        </div>
+                                    </div>
+                                ` : ''}
+                                
+                                ${email.attachments.length > 0 ? `
+                                    <div>
+                                        <div class="text-sm font-medium text-gray-700 mb-2">Pièces jointes:</div>
+                                        <div class="flex flex-wrap gap-2">
+                                            ${email.attachments.map(att => `
+                                                <div class="flex items-center gap-2 px-3 py-1 bg-gray-100 rounded text-sm">
+                                                    ${getFileIcon(att.type)}
+                                                    <span class="truncate max-w-xs">${att.name}</span>
+                                                </div>
+                                            `).join('')}
+                                        </div>
+                                    </div>
+                                ` : ''}
+                            </div>
+                        `).join('')}
+                    </div>
+                `;
+            }
+
+            document.getElementById('app').innerHTML = `
+                <div class="min-h-screen bg-gray-50 p-6">
+                    <div class="max-w-7xl mx-auto">
+                        <div class="bg-white rounded-lg shadow-sm p-6 mb-6">
+                            <div class="flex justify-between items-center">
+                                <div>
+                                    <h1 class="text-3xl font-bold text-gray-800 mb-2">📧 Gestionnaire Gmail</h1>
+                                    <p class="text-gray-600">Analyse intelligente de vos courriels</p>
+                                </div>
+                                <div class="flex gap-2">
+                                    <button onclick="loadGmailMessages()" class="bg-blue-500 hover:bg-blue-600 text-white px-4 py-2 rounded-lg transition flex items-center gap-2">
+                                        <span>🔄</span>
+                                        Actualiser
+                                    </button>
+                                    <button onclick="handleSignoutClick()" class="bg-gray-500 hover:bg-gray-600 text-white px-4 py-2 rounded-lg transition">
+                                        Déconnexion
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="bg-white rounded-lg shadow-sm mb-6">
+                            <div class="flex border-b overflow-x-auto">
+                                <button onclick="activeTab='dashboard'; render();" class="px-6 py-3 font-medium whitespace-nowrap ${activeTab === 'dashboard' ? 'border-b-2 border-blue-500 text-blue-600' : 'text-gray-600'}">
+                                    Tableau de bord
+                                </button>
+                                <button onclick="activeTab='actions'; render();" class="px-6 py-3 font-medium whitespace-nowrap ${activeTab === 'actions' ? 'border-b-2 border-blue-500 text-blue-600' : 'text-gray-600'}">
+                                    Actions (${allActions.length})
+                                </button>
+                                <button onclick="activeTab='attachments'; render();" class="px-6 py-3 font-medium whitespace-nowrap ${activeTab === 'attachments' ? 'border-b-2 border-blue-500 text-blue-600' : 'text-gray-600'}">
+                                    Pièces jointes (${allAttachments.length})
+                                </button>
+                                <button onclick="activeTab='emails'; render();" class="px-6 py-3 font-medium whitespace-nowrap ${activeTab === 'emails' ? 'border-b-2 border-blue-500 text-blue-600' : 'text-gray-600'}">
+                                    Courriels (${emails.length})
+                                </button>
+                            </div>
+                        </div>
+
+                        ${content}
+                    </div>
+                </div>
+            `;
+        }
+
+        function getActionIcon(type) {
+            switch(type) {
+                case 'meeting': return '📅';
+                case 'call': return '📞';
+                case 'task': return '✅';
+                default: return '⚠️';
+            }
+        }
+
+        function getPriorityClass(priority) {
+            switch(priority) {
+                case 'high': return 'text-red-600 bg-red-50 border-red-200';
+                case 'medium': return 'text-yellow-600 bg-yellow-50 border-yellow-200';
+                case 'low': return 'text-green-600 bg-green-50 border-green-200';
+                default: return 'text-gray-600 bg-gray-50 border-gray-200';
+            }
+        }
+
+        function getFileIcon(type) {
+            switch(type) {
+                case 'pdf': return '📄';
+                case 'image': return '🖼️';
+                case 'document': return '📝';
+                default: return '📎';
+            }
+        }
+
+        // Rendre les fonctions accessibles globalement
+        window.handleAuthClick = handleAuthClick;
+        window.handleSignoutClick = handleSignoutClick;
+        window.loadGmailMessages = loadGmailMessages;
+        window.render = render;
+
+        // Initialiser l'app au chargement
+        loadGoogleAPI();
+    </script>
+</body>
+</html>
